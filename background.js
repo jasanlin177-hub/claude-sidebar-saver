@@ -1,363 +1,397 @@
-// background.js — Claude Sidebar Saver Service Worker
+// background.js — Claude Sidebar Saver Service Worker v2
+// Fixed: broader URL matching + debug logging
 
-// ─── ConversationManager ────────────────────────────────────────────────────
+console.log('[CSS] Service Worker starting up...');
+
+// —— ConversationManager ————————————————————————————
 
 class ConversationManager {
-  constructor() {
-    this.STORAGE_KEY = "css_conversations";
-    this.MAX_CONVERSATIONS = 200;
-    this.pendingRequests = new Map(); // requestId → { conversationId, userMessage }
-  }
+    constructor() {
+          this.STORAGE_KEY = "css_conversations";
+          this.MAX_CONVERSATIONS = 200;
+          this.pendingRequests = new Map(); // requestId → { conversationId, userMessage }
+    }
 
   async getAll() {
-    const data = await chrome.storage.local.get(this.STORAGE_KEY);
-    return data[this.STORAGE_KEY] || [];
+        const data = await chrome.storage.local.get(this.STORAGE_KEY);
+        return data[this.STORAGE_KEY] || [];
   }
 
   async getById(id) {
-    const all = await this.getAll();
-    return all.find((c) => c.id === id) || null;
+        const all = await this.getAll();
+        return all.find((c) => c.id === id) || null;
   }
 
   async save(conversation) {
-    const all = await this.getAll();
-    const idx = all.findIndex((c) => c.id === conversation.id);
-    if (idx >= 0) {
-      all[idx] = conversation;
-    } else {
-      all.unshift(conversation);
-      if (all.length > this.MAX_CONVERSATIONS) all.pop();
-    }
-    await chrome.storage.local.set({ [this.STORAGE_KEY]: all });
-    return conversation;
+        const all = await this.getAll();
+        const idx = all.findIndex((c) => c.id === conversation.id);
+        if (idx >= 0) {
+                all[idx] = conversation;
+        } else {
+                all.unshift(conversation);
+                if (all.length > this.MAX_CONVERSATIONS) all.pop();
+        }
+        await chrome.storage.local.set({ [this.STORAGE_KEY]: all });
+        return conversation;
   }
 
   async delete(id) {
-    const all = await this.getAll();
-    const filtered = all.filter((c) => c.id !== id);
-    await chrome.storage.local.set({ [this.STORAGE_KEY]: filtered });
+        const all = await this.getAll();
+        const filtered = all.filter((c) => c.id !== id);
+        await chrome.storage.local.set({ [this.STORAGE_KEY]: filtered });
   }
 
   async getStats() {
-    const all = await this.getAll();
-    const totalMessages = all.reduce((sum, c) => sum + c.messages.length, 0);
-    return { totalConversations: all.length, totalMessages };
+        const all = await this.getAll();
+        const totalMessages = all.reduce((sum, c) => sum + c.messages.length, 0);
+        return { totalConversations: all.length, totalMessages };
   }
 
   createConversation(userMessage, url) {
-    const now = Date.now();
-    const title =
-      userMessage.length > 60
-        ? userMessage.slice(0, 60) + "…"
-        : userMessage || "Untitled Conversation";
-    return {
-      id: `conv_${now}_${Math.random().toString(36).slice(2, 7)}`,
-      title,
-      url,
-      createdAt: now,
-      updatedAt: now,
-      messages: [{ role: "user", content: userMessage, timestamp: now }],
-    };
+        const now = Date.now();
+        const title =
+                userMessage.length > 60
+            ? userMessage.slice(0, 60) + "…"
+                  : userMessage || "Untitled Conversation";
+        return {
+                id: `conv_${now}_${Math.random().toString(36).slice(2, 7)}`,
+                title,
+                url,
+                createdAt: now,
+                updatedAt: now,
+                messages: [{ role: "user", content: userMessage, timestamp: now }],
+        };
   }
 
   appendAssistantMessage(conversation, content) {
-    conversation.messages.push({
-      role: "assistant",
-      content,
-      timestamp: Date.now(),
-    });
-    conversation.updatedAt = Date.now();
-    return conversation;
+        conversation.messages.push({
+                role: "assistant",
+                content,
+                timestamp: Date.now(),
+        });
+        conversation.updatedAt = Date.now();
+        return conversation;
   }
 }
 
 const manager = new ConversationManager();
 
-// ─── webRequest: intercept user messages ────────────────────────────────────
+// —— Helper: detect if URL is a Claude messages API ————————————
+
+function isClaudeMessagesAPI(url) {
+    // Matches various possible Claude API endpoints
+  if (url.includes('messages') && (
+        url.includes('anthropic.com') ||
+        url.includes('claude.ai') ||
+        url.includes('api.') 
+        )) return true;
+    // Also match the beta endpoint seen in DevTools
+  if (url.includes('messages?beta=true')) return true;
+    return false;
+}
+
+// —— webRequest: intercept user messages ————————————————————————
 
 chrome.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    if (details.method !== "POST") return;
-    if (!details.url.includes("/api/")) return;
+    (details) => {
+          console.log('[CSS] onBeforeRequest:', details.method, details.url);
 
-    try {
-      const bodyBytes = details.requestBody?.raw?.[0]?.bytes;
-      if (!bodyBytes) return;
-      const bodyText = new TextDecoder("utf-8").decode(bodyBytes);
-      const body = JSON.parse(bodyText);
+      if (details.method !== "POST") return;
+          if (!isClaudeMessagesAPI(details.url)) return;
 
-      // Claude API sends messages array; grab the last user turn
-      const messages = body.messages || body.prompt?.messages || [];
-      const lastUser = [...messages].reverse().find((m) => m.role === "user");
-      if (!lastUser) return;
+      console.log('[CSS] Matched Claude API request:', details.url);
 
-      const userText =
-        typeof lastUser.content === "string"
-          ? lastUser.content
-          : lastUser.content
-              ?.filter((b) => b.type === "text")
-              .map((b) => b.text)
-              .join("\n") || "";
+      try {
+              const bodyBytes = details.requestBody?.raw?.[0]?.bytes;
+              if (!bodyBytes) {
+                        console.log('[CSS] No request body found');
+                        return;
+              }
+              const bodyText = new TextDecoder("utf-8").decode(bodyBytes);
+              console.log('[CSS] Request body preview:', bodyText.substring(0, 200));
+              const body = JSON.parse(bodyText);
 
-      if (!userText.trim()) return;
+            // Claude API sends messages array; grab the last user turn
+            const messages = body.messages || body.prompt?.messages || [];
+              const lastUser = [...messages].reverse().find((m) => m.role === "user");
+              if (!lastUser) return;
 
-      manager.pendingRequests.set(details.requestId, {
-        userMessage: userText.trim(),
-        url: details.initiator || details.url,
-      });
-    } catch (_) {
-      // JSON parse failed or unexpected shape — silently skip
-    }
+            const userText =
+                      typeof lastUser.content === "string"
+                  ? lastUser.content
+                        : lastUser.content
+                      ?.filter((b) => b.type === "text")
+                      .map((b) => b.text)
+                      .join("\n") || "";
+
+            if (!userText.trim()) return;
+
+            console.log('[CSS] Captured user message:', userText.substring(0, 100));
+
+            manager.pendingRequests.set(details.requestId, {
+                      userMessage: userText.trim(),
+                      url: details.initiator || details.url,
+            });
+      } catch (e) {
+              console.log('[CSS] Parse error:', e.message);
+      }
+    },
+  {
+        urls: [
+                "*://api.anthropic.com/*",
+                "*://claude.ai/*",
+                "*://*.anthropic.com/*",
+                "*://*.claude.ai/*"
+              ]
   },
-  { urls: ["*://claude.ai/api/*", "*://api.anthropic.com/*"] },
-  ["requestBody"]
-);
+    ["requestBody"]
+  );
 
-// ─── webRequest: intercept completed response ────────────────────────────────
+// —— webRequest: intercept completed response ————————————————————
 
 chrome.webRequest.onCompleted.addListener(
-  async (details) => {
-    const pending = manager.pendingRequests.get(details.requestId);
-    if (!pending) return;
-    manager.pendingRequests.delete(details.requestId);
+    async (details) => {
+          console.log('[CSS] onCompleted:', details.url, 'status:', details.statusCode);
 
-    // Re-fetch the same endpoint to read the response body
-    try {
-      const resp = await fetch(details.url);
-      const rawText = await resp.text();
-      const assistantText = parseSSEOrJSON(rawText);
-      if (!assistantText) return;
+      const pending = manager.pendingRequests.get(details.requestId);
+          if (!pending) return;
+          manager.pendingRequests.delete(details.requestId);
 
-      const conversation = manager.createConversation(
-        pending.userMessage,
-        pending.url
-      );
-      manager.appendAssistantMessage(conversation, assistantText);
-      await manager.save(conversation);
+      if (details.statusCode < 200 || details.statusCode >= 300) return;
 
-      chrome.notifications.create({
-        type: "basic",
-        iconUrl: "icons/icon48.png",
-        title: "Claude Sidebar Saver",
-        message: `已儲存對話：${conversation.title}`,
-      });
-    } catch (err) {
-      console.warn("[CSS] Failed to capture response:", err);
-    }
-  },
-  { urls: ["*://claude.ai/api/*", "*://api.anthropic.com/*"] }
-);
+      console.log('[CSS] Fetching response for:', details.url);
 
-// ─── SSE / JSON response parser ──────────────────────────────────────────────
-
-function parseSSEOrJSON(raw) {
-  // Try SSE streaming format first (data: {...}\n)
-  const sseLines = raw
-    .split("\n")
-    .filter((l) => l.startsWith("data:"))
-    .map((l) => l.slice(5).trim())
-    .filter((l) => l && l !== "[DONE]");
-
-  if (sseLines.length > 0) {
-    const parts = [];
-    for (const line of sseLines) {
       try {
-        const obj = JSON.parse(line);
-        // Anthropic streaming delta
-        const delta =
-          obj?.delta?.text ||
-          obj?.completion ||
-          obj?.content?.[0]?.text ||
-          "";
-        if (delta) parts.push(delta);
-      } catch (_) {}
-    }
-    if (parts.length > 0) return parts.join("");
-  }
+              // Re-fetch the conversation list from Claude's API to get the assistant reply
+            // Since we can't read the streaming response body directly,
+            // we save what we have and mark for later update
+            const conversation = manager.createConversation(
+                      pending.userMessage,
+                      pending.url
+                    );
 
-  // Fallback: plain JSON
-  try {
-    const obj = JSON.parse(raw);
-    return (
-      obj?.content?.[0]?.text ||
-      obj?.completion ||
-      obj?.message?.content?.[0]?.text ||
-      null
-    );
-  } catch (_) {
-    return null;
+            // Try to get the response by fetching the URL again (works for non-streaming)
+            const resp = await fetch(details.url, {
+                      credentials: "include",
+                      headers: { "Content-Type": "application/json" },
+            }).catch(() => null);
+
+            if (resp && resp.ok) {
+                      const text = await resp.text();
+                      // Try to parse SSE or JSON response
+                const assistantText = parseClaudeResponse(text);
+                      if (assistantText) {
+                                  manager.appendAssistantMessage(conversation, assistantText);
+                      }
+            }
+
+            await manager.save(conversation);
+              console.log('[CSS] Saved conversation:', conversation.id);
+
+      } catch (e) {
+              console.log('[CSS] Error saving conversation:', e.message);
+      }
+    },
+  {
+        urls: [
+                "*://api.anthropic.com/*",
+                "*://claude.ai/*",
+                "*://*.anthropic.com/*",
+                "*://*.claude.ai/*"
+              ]
   }
+  );
+
+// —— Also monitor ALL requests for debugging ———————————————————
+
+chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+          if (details.method === "POST") {
+                  console.log('[CSS-DEBUG] POST request to:', details.url);
+          }
+    },
+  { urls: ["<all_urls>"] },
+    ["requestBody"]
+  );
+
+// —— Helper: parse Claude streaming/JSON response ——————————————
+
+function parseClaudeResponse(text) {
+    try {
+          // Try direct JSON first
+      const json = JSON.parse(text);
+          if (json.content) {
+                  return json.content
+                    .filter((b) => b.type === "text")
+                    .map((b) => b.text)
+                    .join("\n");
+          }
+          if (json.completion) return json.completion;
+    } catch (_) {}
+
+  // Try SSE format: data: {...}
+  const lines = text.split("\n");
+    const parts = [];
+    for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") break;
+          try {
+                  const obj = JSON.parse(data);
+                  if (obj.type === "content_block_delta" && obj.delta?.text) {
+                            parts.push(obj.delta.text);
+                  } else if (obj.delta?.type === "text_delta" && obj.delta?.text) {
+                            parts.push(obj.delta.text);
+                  } else if (obj.completion) {
+                            parts.push(obj.completion);
+                  }
+          } catch (_) {}
+    }
+    return parts.join("") || null;
 }
 
-// ─── Markdown exporter ───────────────────────────────────────────────────────
+// —— Message handler (popup ↔ background) ————————————————————
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    console.log('[CSS] Message received:', msg.type);
+    handleMessage(msg).then(sendResponse).catch((e) => sendResponse({ error: e.message }));
+    return true; // keep channel open for async
+});
+
+async function handleMessage(msg) {
+    switch (msg.type) {
+      case "getConversations": {
+              return await manager.getAll();
+      }
+      case "getConversation": {
+              return await manager.getById(msg.id);
+      }
+      case "deleteConversation": {
+              await manager.delete(msg.id);
+              return { ok: true };
+      }
+      case "getStats": {
+              return await manager.getStats();
+      }
+      case "exportMarkdown": {
+              const conv = await manager.getById(msg.id);
+              if (!conv) throw new Error("Conversation not found");
+              return { markdown: conversationToMarkdown(conv) };
+      }
+      case "exportAllMarkdown": {
+              const all = await manager.getAll();
+              const md = all.map(conversationToMarkdown).join("\n\n---\n\n");
+              return { markdown: md };
+      }
+      case "syncToNotion": {
+              const conv = await manager.getById(msg.id);
+              if (!conv) throw new Error("Conversation not found");
+              return await syncConversationToNotion(conv);
+      }
+      default:
+              throw new Error(`Unknown message type: ${msg.type}`);
+    }
+}
+
+// —— Markdown export ——————————————————————————————————————————
 
 function conversationToMarkdown(conv) {
-  const date = new Date(conv.createdAt).toLocaleString("zh-TW");
-  const lines = [
-    `# ${conv.title}`,
-    ``,
-    `> **時間**：${date}  `,
-    `> **來源**：${conv.url}`,
-    ``,
-    `---`,
-    ``,
-  ];
-  for (const msg of conv.messages) {
-    const role = msg.role === "user" ? "🧑 **使用者**" : "🤖 **Claude**";
-    lines.push(role, "", msg.content, "", "---", "");
-  }
-  return lines.join("\n");
+    const date = new Date(conv.createdAt).toLocaleString();
+    let md = `# ${conv.title}\n\n`;
+    md += `**Date:** ${date}  \n`;
+    md += `**URL:** ${conv.url || "N/A"}  \n\n`;
+    md += `---\n\n`;
+    for (const msg of conv.messages) {
+          const role = msg.role === "user" ? "**You**" : "**Claude**";
+          md += `${role}\n\n${msg.content}\n\n`;
+    }
+    return md;
 }
 
-// ─── Notion sync ─────────────────────────────────────────────────────────────
+// —— Notion sync ——————————————————————————————————————————————
 
-async function syncToNotion(conversationId) {
-  const { notion_token, notion_database_id } = await chrome.storage.sync.get([
-    "notion_token",
-    "notion_database_id",
-  ]);
+async function syncConversationToNotion(conv) {
+    const { notionToken, notionDatabaseId } = await chrome.storage.sync.get([
+          "notionToken",
+          "notionDatabaseId",
+        ]);
 
-  if (!notion_token || !notion_database_id) {
-    throw new Error("請先在設定頁面填入 Notion Token 和 Database ID");
+  if (!notionToken || !notionDatabaseId) {
+        throw new Error("Notion token or database ID not configured. Please go to Options.");
   }
 
-  const conv = await manager.getById(conversationId);
-  if (!conv) throw new Error("找不到對話");
-
-  const NOTION_API = "https://api.notion.com/v1";
-  const headers = {
-    Authorization: `Bearer ${notion_token}`,
-    "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28",
-  };
-
-  // Helper: split text into ≤2000-char rich_text chunks
-  function richText(text) {
-    const chunks = [];
-    for (let i = 0; i < text.length; i += 2000) {
-      chunks.push({ type: "text", text: { content: text.slice(i, i + 2000) } });
-    }
-    return chunks;
-  }
-
-  // Build blocks for all messages
-  function buildMessageBlocks(messages) {
-    const blocks = [];
-    for (const msg of messages) {
-      const label = msg.role === "user" ? "🧑 使用者" : "🤖 Claude";
-      blocks.push({
-        object: "block",
-        type: "heading_3",
-        heading_3: { rich_text: [{ type: "text", text: { content: label } }] },
-      });
-      // Split long content into paragraph blocks (each block body ≤ 2000 chars)
-      const content = msg.content || "";
-      for (let i = 0; i < content.length; i += 2000) {
-        blocks.push({
-          object: "block",
-          type: "paragraph",
-          paragraph: { rich_text: richText(content.slice(i, i + 2000)) },
-        });
-      }
-      blocks.push({
-        object: "block",
-        type: "divider",
-        divider: {},
-      });
-    }
-    return blocks;
-  }
-
-  // Create the Notion page
-  const pageRes = await fetch(`${NOTION_API}/pages`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      parent: { database_id: notion_database_id },
-      properties: {
-        title: {
-          title: richText(conv.title.slice(0, 2000)),
+  // Create the page
+  const pageRes = await fetch("https://api.notion.com/v1/pages", {
+        method: "POST",
+        headers: {
+                Authorization: `Bearer ${notionToken}`,
+                "Content-Type": "application/json",
+                "Notion-Version": "2022-06-28",
         },
-      },
-    }),
+        body: JSON.stringify({
+                parent: { database_id: notionDatabaseId },
+                properties: {
+                          Name: { title: [{ text: { content: conv.title.slice(0, 200) } }] },
+                          Date: { date: { start: new Date(conv.createdAt).toISOString() } },
+                          Messages: { number: conv.messages.length },
+                },
+        }),
   });
 
   if (!pageRes.ok) {
-    const err = await pageRes.json();
-    throw new Error(`Notion 建立頁面失敗：${err.message || pageRes.status}`);
+        const err = await pageRes.json();
+        throw new Error(`Notion API error: ${err.message}`);
   }
 
   const page = await pageRes.json();
-  const pageId = page.id;
+    const pageId = page.id;
 
-  // Append blocks in chunks of 100 (Notion API limit)
-  const allBlocks = buildMessageBlocks(conv.messages);
-  for (let i = 0; i < allBlocks.length; i += 100) {
-    const chunk = allBlocks.slice(i, i + 100);
-    const appendRes = await fetch(`${NOTION_API}/blocks/${pageId}/children`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ children: chunk }),
-    });
-    if (!appendRes.ok) {
-      const err = await appendRes.json();
-      throw new Error(`Notion 附加內容失敗：${err.message || appendRes.status}`);
+  // Build blocks from messages (max 100 per request, 2000 chars per rich_text)
+  const allBlocks = [];
+    for (const msg of conv.messages) {
+          const label = msg.role === "user" ? "You" : "Claude";
+          allBlocks.push({
+                  object: "block",
+                  type: "heading_3",
+                  heading_3: { rich_text: [{ text: { content: label } }] },
+          });
+
+      // Split content into 2000-char chunks
+      const content = msg.content || "";
+          for (let i = 0; i < content.length; i += 1990) {
+                  allBlocks.push({
+                            object: "block",
+                            type: "paragraph",
+                            paragraph: {
+                                        rich_text: [{ text: { content: content.slice(i, i + 1990) } }],
+                            },
+                  });
+          }
+          allBlocks.push({ object: "block", type: "divider", divider: {} });
     }
+
+  // Upload in batches of 100
+  for (let i = 0; i < allBlocks.length; i += 100) {
+        const batch = allBlocks.slice(i, i + 100);
+        const batchRes = await fetch(
+                `https://api.notion.com/v1/blocks/${pageId}/children`,
+          {
+                    method: "PATCH",
+                    headers: {
+                                Authorization: `Bearer ${notionToken}`,
+                                "Content-Type": "application/json",
+                                "Notion-Version": "2022-06-28",
+                    },
+                    body: JSON.stringify({ children: batch }),
+          }
+              );
+        if (!batchRes.ok) {
+                const err = await batchRes.json();
+                throw new Error(`Notion blocks error: ${err.message}`);
+        }
   }
 
-  return { pageId, pageUrl: page.url };
+  return { ok: true, pageId, pageUrl: page.url };
 }
 
-// ─── Message handler (popup ↔ background) ────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  const handle = async () => {
-    switch (msg.type) {
-      case "getConversations": {
-        const all = await manager.getAll();
-        const query = (msg.query || "").toLowerCase();
-        const filtered = query
-          ? all.filter(
-              (c) =>
-                c.title.toLowerCase().includes(query) ||
-                c.messages.some((m) =>
-                  m.content.toLowerCase().includes(query)
-                )
-            )
-          : all;
-        return filtered;
-      }
-      case "getConversation":
-        return await manager.getById(msg.id);
-
-      case "deleteConversation":
-        await manager.delete(msg.id);
-        return { ok: true };
-
-      case "exportMarkdown": {
-        const conv = await manager.getById(msg.id);
-        if (!conv) throw new Error("Not found");
-        return { markdown: conversationToMarkdown(conv) };
-      }
-      case "exportAllMarkdown": {
-        const all = await manager.getAll();
-        const combined = all.map(conversationToMarkdown).join("\n\n---\n\n");
-        return { markdown: combined };
-      }
-      case "syncToNotion":
-        return await syncToNotion(msg.id);
-
-      case "getStats":
-        return await manager.getStats();
-
-      default:
-        throw new Error(`Unknown message type: ${msg.type}`);
-    }
-  };
-
-  handle()
-    .then((result) => sendResponse({ ok: true, data: result }))
-    .catch((err) => sendResponse({ ok: false, error: err.message }));
-
-  return true; // keep channel open for async
-});
+console.log('[CSS] Service Worker initialized. Listening for Claude API requests...');
