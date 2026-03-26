@@ -1,226 +1,196 @@
-// Content Script for Claude Sidebar Saver v4
-// Injected into Claude sidebar extension page to intercept fetch requests
-// This runs in the context of the Claude sidebar page
+// content-script.js — MAIN world script for Claude Sidebar Saver v4
+// Runs in the page's JS context (world: "MAIN") to monkey-patch fetch/XHR
+// Communicates to the ISOLATED world bridge via window.postMessage
 
 (function() {
-    'use strict';
+      'use strict';
 
-   console.log('[CSS-ContentScript] Content script loaded in Claude sidebar page');
-    console.log('[CSS-ContentScript] URL:', window.location.href);
+   const CSS_MSG_PREFIX = '__CSS_INTERCEPT__';
 
-   // Store the original fetch
+   console.log('[CSS-Main] Content script (MAIN world) loaded');
+      console.log('[CSS-Main] URL:', window.location.href);
+
+   function postToIsolated(data) {
+           window.postMessage({ source: CSS_MSG_PREFIX, payload: data }, '*');
+   }
+
+   // ── Intercept fetch ──────────
    const originalFetch = window.fetch;
 
-   // Override fetch to intercept API calls
    window.fetch = async function(...args) {
-         const [resource, config] = args;
-         const url = typeof resource === 'string' ? resource : resource.url;
+           const [resource, config] = args;
+           const url = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
 
-         // Check if this is a Claude API message request
-         if (url && (url.includes('/messages') || url.includes('/chat_conversations'))) {
-                 console.log('[CSS-ContentScript] Intercepted fetch:', url);
+           const isTargetUrl = url && (
+                     url.includes('/messages') || 
+                     url.includes('/chat_conversations') ||
+                     url.includes('/completion') ||
+                     url.includes('api.anthropic.com')
+                   );
 
-           try {
-                     // Capture the request body (user message)
-                   if (config && config.body) {
-                               let bodyData;
-                               if (typeof config.body === 'string') {
-                                             bodyData = JSON.parse(config.body);
-                               } else if (config.body instanceof ReadableStream) {
-                                             // Clone the stream to read it
-                                 const cloned = config.body.tee();
-                                             config.body = cloned[0];
-                                             const reader = cloned[1].getReader();
-                                             const chunks = [];
-                                             let done = false;
-                                             while (!done) {
-                                                             const result = await reader.read();
-                                                             done = result.done;
-                                                             if (result.value) chunks.push(result.value);
-                                             }
-                                             const text = new TextDecoder().decode(new Uint8Array(chunks.flat()));
-                                             bodyData = JSON.parse(text);
-                               }
+           if (isTargetUrl) {
+                     console.log('[CSS-Main] Fetch intercepted:', config && config.method || 'GET', url);
 
-                       if (bodyData) {
-                                     console.log('[CSS-ContentScript] Request body captured');
-                                     // Send to background script
-                                 chrome.runtime.sendMessage({
-                                                 type: 'API_REQUEST',
-                                                 url: url,
-                                                 method: config.method || 'GET',
-                                                 body: bodyData,
-                                                 timestamp: Date.now()
-                                 });
-                       }
-                   }
-           } catch (e) {
-                     console.log('[CSS-ContentScript] Error parsing request:', e.message);
-           }
-         }
+             // Capture request body
+             try {
+                         if (config && config.body) {
+                                       let bodyStr = '';
+                                       if (typeof config.body === 'string') {
+                                                       bodyStr = config.body;
+                                       } else if (config.body instanceof Blob) {
+                                                       bodyStr = await config.body.text();
+                                       } else if (config.body instanceof ArrayBuffer) {
+                                                       bodyStr = new TextDecoder().decode(config.body);
+                                       }
 
-         // Call original fetch and intercept the response
-         const response = await originalFetch.apply(this, args);
-
-         // Clone response to read it without consuming
-         if (url && (url.includes('/messages') || url.includes('/chat_conversations'))) {
-                 try {
-                           const clonedResponse = response.clone();
-                           const contentType = clonedResponse.headers.get('content-type') || '';
-
-                   if (contentType.includes('text/event-stream')) {
-                               // Handle SSE streaming response (Claude's typical response format)
-                             console.log('[CSS-ContentScript] SSE stream response detected');
-                               const reader = clonedResponse.body.getReader();
-                               const decoder = new TextDecoder();
-                               let fullText = '';
-                               let assistantMessage = '';
-
-                             const readStream = async () => {
+                           if (bodyStr) {
                                            try {
-                                                           while (true) {
-                                                                             const { done, value } = await reader.read();
-                                                                             if (done) break;
-                                                                             const chunk = decoder.decode(value, { stream: true });
-                                                                             fullText += chunk;
-
-                                                             // Parse SSE events to extract text
-                                                             const lines = chunk.split('\n');
-                                                                             for (const line of lines) {
-                                                                                                 if (line.startsWith('data: ')) {
-                                                                                                                       try {
-                                                                                                                                               const data = JSON.parse(line.slice(6));
-                                                                                                                                               if (data.type === 'content_block_delta' && data.delta && data.delta.text) {
-                                                                                                                                                                         assistantMessage += data.delta.text;
-                                                                                                                                                 }
-                                                                                                                                               if (data.type === 'message_stop') {
-                                                                                                                                                                         console.log('[CSS-ContentScript] Stream complete, message length:', assistantMessage.length);
-                                                                                                                                                                         chrome.runtime.sendMessage({
-                                                                                                                                                                                                     type: 'API_RESPONSE_STREAM_COMPLETE',
-                                                                                                                                                                                                     url: url,
-                                                                                                                                                                                                     assistantMessage: assistantMessage,
-                                                                                                                                                                                                     timestamp: Date.now()
-                                                                                                                                                                           });
-                                                                                                                                                 }
-                                                                                                                         } catch (parseErr) {
-                                                                                                                                               // Not all data lines are JSON
-                                                                                                                         }
-                                                                                                   }
-                                                                             }
-                                                           }
-                                           } catch (streamErr) {
-                                                           console.log('[CSS-ContentScript] Stream read error:', streamErr.message);
+                                                             const bodyData = JSON.parse(bodyStr);
+                                                             postToIsolated({
+                                                                                 type: 'API_REQUEST',
+                                                                                 url: url,
+                                                                                 method: config.method || 'POST',
+                                                                                 body: bodyData,
+                                                                                 timestamp: Date.now()
+                                                             });
+                                           } catch (e) {
+                                                             // Body not JSON
+                                             postToIsolated({
+                                                                 type: 'API_REQUEST',
+                                                                 url: url,
+                                                                 method: config.method || 'POST',
+                                                                 body: { raw: bodyStr.substring(0, 5000) },
+                                                                 timestamp: Date.now()
+                                             });
                                            }
-                             };
-                               readStream(); // Don't await - let it run in background
+                           }
+                         }
+             } catch (e) {
+                         console.log('[CSS-Main] Error capturing request body:', e.message);
+             }
+           }
 
-                   } else if (contentType.includes('application/json')) {
-                               // Handle JSON response
-                             const data = await clonedResponse.json();
-                               console.log('[CSS-ContentScript] JSON response captured from:', url);
-                               chrome.runtime.sendMessage({
-                                             type: 'API_RESPONSE_JSON',
-                                             url: url,
-                                             data: data,
-                                             timestamp: Date.now()
-                               });
-                   }
-                 } catch (e) {
-                           console.log('[CSS-ContentScript] Error reading response:', e.message);
-                 }
-         }
+           // Call original fetch
+           const response = await originalFetch.apply(this, args);
 
-         return response;
+           // Intercept response for target URLs
+           if (isTargetUrl) {
+                     try {
+                                 const cloned = response.clone();
+                                 const ct = cloned.headers.get('content-type') || '';
+
+                       if (ct.includes('text/event-stream')) {
+                                     // SSE streaming response
+                                   console.log('[CSS-Main] SSE stream detected for:', url);
+                                     const reader = cloned.body.getReader();
+                                     const decoder = new TextDecoder();
+                                     let assistantMsg = '';
+
+                                   (async () => {
+                                                   try {
+                                                                     while (true) {
+                                                                                         const { done, value } = await reader.read();
+                                                                                         if (done) break;
+                                                                                         const chunk = decoder.decode(value, { stream: true });
+                                                                                         const lines = chunk.split('\n');
+                                                                                         for (const line of lines) {
+                                                                                                               if (line.startsWith('data: ')) {
+                                                                                                                                       try {
+                                                                                                                                                                 const evt = JSON.parse(line.slice(6));
+                                                                                                                                                                 if (evt.type === 'content_block_delta' && evt.delta && evt.delta.text) {
+                                                                                                                                                                                             assistantMsg += evt.delta.text;
+                                                                                                                                                                     }
+                                                                                                                                                                 if (evt.type === 'message_stop' || evt.type === 'message_delta') {
+                                                                                                                                                                                             if (assistantMsg.length > 0) {
+                                                                                                                                                                                                                           console.log('[CSS-Main] Stream complete, length:', assistantMsg.length);
+                                                                                                                                                                                                                           postToIsolated({
+                                                                                                                                                                                                                                                           type: 'API_RESPONSE_STREAM_COMPLETE',
+                                                                                                                                                                                                                                                           url: url,
+                                                                                                                                                                                                                                                           assistantMessage: assistantMsg,
+                                                                                                                                                                                                                                                           timestamp: Date.now()
+                                                                                                                                                                                                                                                         });
+                                                                                                                                                                                                                         }
+                                                                                                                                                                     }
+                                                                                                                                           } catch (pe) { /* not JSON */ }
+                                                                                                                   }
+                                                                                             }
+                                                                     }
+                                                                     // Final flush if message_stop wasn't received
+                                                     if (assistantMsg.length > 0) {
+                                                                         postToIsolated({
+                                                                                               type: 'API_RESPONSE_STREAM_COMPLETE',
+                                                                                               url: url,
+                                                                                               assistantMessage: assistantMsg,
+                                                                                               timestamp: Date.now()
+                                                                         });
+                                                     }
+                                                   } catch (se) {
+                                                                     console.log('[CSS-Main] Stream read error:', se.message);
+                                                   }
+                                   })();
+
+                       } else if (ct.includes('application/json')) {
+                                     const data = await cloned.json();
+                                     console.log('[CSS-Main] JSON response from:', url);
+                                     postToIsolated({
+                                                     type: 'API_RESPONSE_JSON',
+                                                     url: url,
+                                                     data: data,
+                                                     timestamp: Date.now()
+                                     });
+                       }
+                     } catch (e) {
+                                 console.log('[CSS-Main] Error reading response:', e.message);
+                     }
+           }
+
+           return response;
    };
 
-   // Also intercept XMLHttpRequest as a fallback
-   const originalXHROpen = XMLHttpRequest.prototype.open;
-    const originalXHRSend = XMLHttpRequest.prototype.send;
+   // ── Intercept XMLHttpRequest ──────────
+   const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
 
    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-         this._cssUrl = url;
-         this._cssMethod = method;
-         return originalXHROpen.call(this, method, url, ...rest);
+           this._cssUrl = url;
+           this._cssMethod = method;
+           return origOpen.call(this, method, url, ...rest);
    };
 
    XMLHttpRequest.prototype.send = function(body) {
-         if (this._cssUrl && (this._cssUrl.includes('/messages') || this._cssUrl.includes('/chat_conversations'))) {
-                 console.log('[CSS-ContentScript] XHR intercepted:', this._cssMethod, this._cssUrl);
+           const isTarget = this._cssUrl && (
+                     this._cssUrl.includes('/messages') || 
+                     this._cssUrl.includes('/chat_conversations') ||
+                     this._cssUrl.includes('/completion')
+                   );
 
-           if (body) {
-                     try {
-                                 const bodyData = JSON.parse(body);
-                                 chrome.runtime.sendMessage({
-                                               type: 'API_REQUEST',
-                                               url: this._cssUrl,
-                                               method: this._cssMethod,
-                                               body: bodyData,
-                                               timestamp: Date.now()
-                                 });
-                     } catch (e) {
-                                 // Body might not be JSON
+           if (isTarget) {
+                     console.log('[CSS-Main] XHR intercepted:', this._cssMethod, this._cssUrl);
+                     if (body) {
+                                 try {
+                                               postToIsolated({
+                                                               type: 'API_REQUEST',
+                                                               url: this._cssUrl,
+                                                               method: this._cssMethod,
+                                                               body: JSON.parse(body),
+                                                               timestamp: Date.now()
+                                               });
+                                 } catch (e) { /* not JSON */ }
                      }
+
+             this.addEventListener('load', () => {
+                         try {
+                                       postToIsolated({
+                                                       type: 'API_RESPONSE_JSON',
+                                                       url: this._cssUrl,
+                                                       data: JSON.parse(this.responseText),
+                                                       timestamp: Date.now()
+                                       });
+                         } catch (e) { /* not JSON */ }
+             });
            }
-
-           // Listen for response
-           this.addEventListener('load', function() {
-                     try {
-                                 const data = JSON.parse(this.responseText);
-                                 chrome.runtime.sendMessage({
-                                               type: 'API_RESPONSE_JSON',
-                                               url: this._cssUrl,
-                                               data: data,
-                                               timestamp: Date.now()
-                                 });
-                     } catch (e) {
-                                 // Response might not be JSON
-                     }
-           });
-         }
-         return originalXHRSend.call(this, body);
+           return origSend.call(this, body);
    };
 
-   // Also try to observe DOM changes to capture conversation content directly
-   const observer = new MutationObserver((mutations) => {
-         // Look for new message elements being added
-                                             for (const mutation of mutations) {
-                                                     for (const node of mutation.addedNodes) {
-                                                               if (node.nodeType === Node.ELEMENT_NODE) {
-                                                                           // Check for common message container patterns
-                                                                 const messageEl = node.querySelector ? 
-                                                                               node.querySelector('[data-testid*="message"], .prose, [class*="message"]') : null;
-                                                                           if (messageEl || (node.classList && (
-                                                                                         node.classList.contains('prose') || 
-                                                                                         node.className.includes('message')
-                                                                                       ))) {
-                                                                                         console.log('[CSS-ContentScript] New DOM message element detected');
-                                                                                         // Small delay to let content render
-                                                                             setTimeout(() => {
-                                                                                             const text = (messageEl || node).textContent;
-                                                                                             if (text && text.length > 0) {
-                                                                                                               chrome.runtime.sendMessage({
-                                                                                                                                   type: 'DOM_MESSAGE',
-                                                                                                                                   content: text.substring(0, 10000), // Limit size
-                                                                                                                                   timestamp: Date.now()
-                                                                                                                 });
-                                                                                               }
-                                                                             }, 500);
-                                                                           }
-                                                               }
-                                                     }
-                                             }
-   });
-
-   // Start observing when DOM is ready
-   if (document.body) {
-         observer.observe(document.body, { childList: true, subtree: true });
-         console.log('[CSS-ContentScript] DOM observer started');
-   } else {
-         document.addEventListener('DOMContentLoaded', () => {
-                 observer.observe(document.body, { childList: true, subtree: true });
-                 console.log('[CSS-ContentScript] DOM observer started (after DOMContentLoaded)');
-         });
-   }
-
-   console.log('[CSS-ContentScript] All interceptors installed successfully');
+   console.log('[CSS-Main] Fetch and XHR interceptors installed');
 })();
