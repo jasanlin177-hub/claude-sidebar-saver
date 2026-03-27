@@ -19,94 +19,119 @@
 
   window.fetch = async function(...args) {
     const [resource, config] = args;
-    const url = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
+    let url = '';
+    let method = 'GET';
+    let reqBodyStr = null;
 
-    const isTargetUrl = url && (
-      url.includes('/messages') ||
-      url.includes('/chat_conversations') ||
-      url.includes('/completion') ||
-      url.includes('api.anthropic.com')
-    );
+    // 安全地提取 URL 與 Method
+    try {
+      if (typeof resource === 'string') {
+        url = resource;
+      } else if (resource instanceof URL) {
+        url = resource.href;
+      } else if (resource instanceof Request) {
+        url = resource.url;
+        method = resource.method;
+      }
+      if (config && config.method) method = config.method;
 
-    if (isTargetUrl) {
-      console.log('[CSS-Main] Fetch intercepted:', config && config.method || 'GET', url);
+      const isTargetUrl = url && (
+        url.includes('/messages') ||
+        url.includes('/chat_conversations') ||
+        url.includes('/completion') ||
+        url.includes('api.anthropic.com')
+      );
 
-      // Capture request body
-      try {
+      // 提取 Request Body (排除 OPTIONS 請求)
+      if (isTargetUrl && method !== 'OPTIONS') {
         if (config && config.body) {
-          let bodyStr = '';
-          if (typeof config.body === 'string') {
-            bodyStr = config.body;
-          } else if (config.body instanceof Blob) {
-            bodyStr = await config.body.text();
-          } else if (config.body instanceof ArrayBuffer) {
-            bodyStr = new TextDecoder().decode(config.body);
-          }
+          if (typeof config.body === 'string') reqBodyStr = config.body;
+        } else if (resource instanceof Request && !resource.bodyUsed) {
+          try {
+            reqBodyStr = await resource.clone().text();
+          } catch(e) {}
+        }
 
-          if (bodyStr) {
-            try {
-              const bodyData = JSON.parse(bodyStr);
-              postToIsolated({
-                type: 'API_REQUEST',
-                url: url,
-                method: config.method || 'POST',
-                body: bodyData,
-                timestamp: Date.now()
-              });
-            } catch (e) {
-              postToIsolated({
-                type: 'API_REQUEST',
-                url: url,
-                method: config.method || 'POST',
-                body: { raw: bodyStr.substring(0, 5000) },
-                timestamp: Date.now()
-              });
-            }
+        if (reqBodyStr) {
+          try {
+            postToIsolated({
+              type: 'API_REQUEST',
+              url: url,
+              method: method,
+              body: JSON.parse(reqBodyStr),
+              timestamp: Date.now()
+            });
+          } catch (e) {
+            postToIsolated({
+              type: 'API_REQUEST',
+              url: url,
+              method: method,
+              body: { raw: reqBodyStr.substring(0, 5000) },
+              timestamp: Date.now()
+            });
           }
         }
-      } catch (e) {
-        console.log('[CSS-Main] Error capturing request body:', e.message);
       }
+    } catch (e) {
+      console.log('[CSS-Main] Error capturing request body:', e.message);
     }
 
     // Call original fetch
     const response = await originalFetch.apply(this, args);
 
-    // Intercept response for target URLs
-    if (isTargetUrl) {
-      try {
+    // 處理 Response
+    try {
+      const urlToCheck = url || (response && response.url) || '';
+      const isTargetUrl = urlToCheck && (
+        urlToCheck.includes('/messages') ||
+        urlToCheck.includes('/chat_conversations') ||
+        urlToCheck.includes('/completion') ||
+        urlToCheck.includes('api.anthropic.com')
+      );
+
+      if (isTargetUrl && response.ok) {
         const cloned = response.clone();
         const ct = cloned.headers.get('content-type') || '';
 
         if (ct.includes('text/event-stream')) {
-          // SSE streaming response
-          console.log('[CSS-Main] SSE stream detected for:', url);
+          console.log('[CSS-Main] SSE stream detected for:', urlToCheck);
           const reader = cloned.body.getReader();
           const decoder = new TextDecoder();
           let assistantMsg = '';
-          let alreadySent = false; // ← Fix: prevent duplicate sends
+          let alreadySent = false;
+          let buffer = ''; // 加入 Buffer 解決 Chunk 被截斷的問題
 
           (async () => {
             try {
               while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
-                const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split('\n');
+                
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop(); // 保留最後一行不完整的 Chunk
+
                 for (const line of lines) {
-                  if (line.startsWith('data: ')) {
+                  const trimmed = line.trim();
+                  if (trimmed.startsWith('data:')) {
+                    const dataContent = trimmed.slice(5).trim();
+                    if (dataContent === '[DONE]') continue;
+                    
                     try {
-                      const evt = JSON.parse(line.slice(6));
-                      if (evt.type === 'content_block_delta' && evt.delta && evt.delta.text) {
+                      const evt = JSON.parse(dataContent);
+                      if ((evt.type === 'content_block_delta' || evt.type === 'text_delta') && evt.delta && evt.delta.text) {
                         assistantMsg += evt.delta.text;
+                      } else if (evt.type === 'completion' && evt.completion) {
+                        assistantMsg += evt.completion;
                       }
-                      if (evt.type === 'message_stop' || evt.type === 'message_delta') {
+                      
+                      if (evt.type === 'message_stop' || evt.type === 'message_delta' || evt.stop_reason) {
                         if (assistantMsg.length > 0 && !alreadySent) {
-                          alreadySent = true; // ← Fix: mark as sent
+                          alreadySent = true;
                           console.log('[CSS-Main] Stream complete, length:', assistantMsg.length);
                           postToIsolated({
                             type: 'API_RESPONSE_STREAM_COMPLETE',
-                            url: url,
+                            url: urlToCheck,
                             assistantMessage: assistantMsg,
                             timestamp: Date.now()
                           });
@@ -116,11 +141,11 @@
                   }
                 }
               }
-              // Final flush only if message_stop wasn't received
+              // 最終強制輸出
               if (assistantMsg.length > 0 && !alreadySent) {
                 postToIsolated({
                   type: 'API_RESPONSE_STREAM_COMPLETE',
-                  url: url,
+                  url: urlToCheck,
                   assistantMessage: assistantMsg,
                   timestamp: Date.now()
                 });
@@ -132,17 +157,17 @@
 
         } else if (ct.includes('application/json')) {
           const data = await cloned.json();
-          console.log('[CSS-Main] JSON response from:', url);
+          console.log('[CSS-Main] JSON response from:', urlToCheck);
           postToIsolated({
             type: 'API_RESPONSE_JSON',
-            url: url,
+            url: urlToCheck,
             data: data,
             timestamp: Date.now()
           });
         }
-      } catch (e) {
-        console.log('[CSS-Main] Error reading response:', e.message);
       }
+    } catch (e) {
+      console.log('[CSS-Main] Error reading response:', e.message);
     }
 
     return response;
