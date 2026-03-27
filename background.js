@@ -218,13 +218,22 @@ async function handleContentMessage(message, sender) {
       case 'API_REQUEST': {
         console.log('[CSS] API Request intercepted:', message.url);
         const body = message.body;
+        let extractedId = null;
 
+        // 嘗試從 URL 提取 ID
         const urlMatch = message.url.match(/chat_conversations\/([a-f0-9-]+)/);
-        if (urlMatch) {
-          currentConversationId = urlMatch[1];
-        } else if (body && body.conversation_id) {
-          currentConversationId = body.conversation_id;
-        } else {
+        if (urlMatch) extractedId = urlMatch[1];
+
+        // 如果 URL 沒有，嘗試從 Body 提取 (Claude 建立新對話時會把 uuid 放這裡)
+        if (!extractedId && body) {
+          if (body.uuid) extractedId = body.uuid;
+          else if (body.conversation_uuid) extractedId = body.conversation_uuid;
+          else if (body.conversation_id) extractedId = body.conversation_id;
+        }
+
+        if (extractedId) {
+          currentConversationId = extractedId;
+        } else if (!currentConversationId) {
           currentConversationId = 'conv_' + Date.now();
         }
 
@@ -232,16 +241,15 @@ async function handleContentMessage(message, sender) {
           let userText = '';
           if (body.prompt) {
             userText = body.prompt;
+          } else if (body.text) {
+            userText = body.text;
           } else if (body.messages && Array.isArray(body.messages)) {
             const lastUserMsg = body.messages.filter(m => m.role === 'user').pop();
             if (lastUserMsg) {
               if (typeof lastUserMsg.content === 'string') {
                 userText = lastUserMsg.content;
               } else if (Array.isArray(lastUserMsg.content)) {
-                userText = lastUserMsg.content
-                  .filter(c => c.type === 'text')
-                  .map(c => c.text)
-                  .join('\n');
+                userText = lastUserMsg.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
               }
             }
           }
@@ -277,10 +285,7 @@ async function handleContentMessage(message, sender) {
           if (data.completion) {
             assistantText = data.completion;
           } else if (data.content && Array.isArray(data.content)) {
-            assistantText = data.content
-              .filter(c => c.type === 'text')
-              .map(c => c.text)
-              .join('\n');
+            assistantText = data.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
           }
           if (assistantText) {
             await manager.addMessage(currentConversationId, 'assistant', assistantText, {
@@ -371,12 +376,11 @@ function formatConversationMarkdown(convo) {
   return md;
 }
 
-// ── Notion Sync (placeholder) ──────────
+// ── Notion Sync ──────────
 async function syncToNotion(conversationId) {
-  // TODO: Implement Notion API integration
   // Requires user to configure Notion API key in options page
-  const options = await chrome.storage.sync.get(['notionApiKey', 'notionDatabaseId']);
-  if (!options.notionApiKey || !options.notionDatabaseId) {
+  const options = await chrome.storage.sync.get(['notion_token', 'notion_database_id']);
+  if (!options.notion_token || !options.notion_database_id) {
     throw new Error('請先在設定頁面配置 Notion API Key 和 Database ID');
   }
 
@@ -389,12 +393,12 @@ async function syncToNotion(conversationId) {
   const response = await fetch('https://api.notion.com/v1/pages', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${options.notionApiKey}`,
+      'Authorization': `Bearer ${options.notion_token}`,
       'Content-Type': 'application/json',
       'Notion-Version': '2022-06-28'
     },
     body: JSON.stringify({
-      parent: { database_id: options.notionDatabaseId },
+      parent: { database_id: options.notion_database_id },
       properties: {
         Name: { title: [{ text: { content: convo.title } }] }
       },
